@@ -1,1 +1,35 @@
+name: Discord to Calendar
 
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 5分ごと(Privateなら '*/30 * * * *' などに)
+  workflow_dispatch:         # 手動実行用
+
+permissions:
+  contents: write            # data/events.json を保存するため
+
+concurrency:
+  group: discord-calendar
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check Discord
+        run: node bot.js
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      - name: Save events
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/events.json
+          git diff --cached --quiet || (git commit -m "update events" && git push)
