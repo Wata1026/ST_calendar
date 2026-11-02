@@ -1,1 +1,290 @@
+// Discord(#カレンダー追加)を確認して、予定を data/events.json に保存する
+// スプレッドシートへの反映は、Apps Script の syncEvents が GitHub から読み取って行う
+const fs = require('fs');
+const path = require('path');
 
+// ===== 設定(Apps Script側の CAL_START / CAL_END と必ず同じにする) =====
+const START = { y: 2026, m: 10 };
+const END   = { y: 2028, m: 4 };
+const READ_EXISTING_ON_FIRST_RUN = false;  // true: 初回にチャンネルの直近100件も処理する
+// ===================================================================
+
+const DATA_FILE = path.join(__dirname, 'data', 'events.json');
+const DISCORD_API = 'https://discord.com/api/v10';
+const TOKEN = process.env.DISCORD_BOT_TOKEN;
+const CHANNEL = process.env.DISCORD_CHANNEL_ID;
+
+if (!TOKEN || !CHANNEL) {
+  console.error('Secrets が足りません: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID');
+  process.exit(1);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+
+// ---------------------------------------------------------------
+//  保存データ { lastMessageId, nextSeq, events: [{seq,y,m,d,text}] }
+// ---------------------------------------------------------------
+
+function loadData() {
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return { lastMessageId: '', nextSeq: 1, events: [] };
+    throw e;   // 壊れているときは、上書きせずに止める
+  }
+}
+
+function saveData(data) {
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 1) + '\n');
+}
+
+
+// ---------------------------------------------------------------
+//  Discord
+// ---------------------------------------------------------------
+
+// Discord APIを呼ぶ(429と5xxは待ってやり直す)。失敗時は例外
+async function discord(apiPath, options = {}) {
+  for (let i = 1; i <= 3; i++) {
+    const res = await fetch(DISCORD_API + apiPath, {
+      ...options,
+      headers: {
+        'Authorization': 'Bot ' + TOKEN,
+        'User-Agent': 'DiscordBot (https://github.com, 1.0)',
+        'Content-Type': 'application/json'
+      }
+    });
+    const text = await res.text();
+    if (res.ok) return text ? JSON.parse(text) : null;
+
+    if ((res.status === 429 || res.status >= 500) && i < 3) {
+      let wait = 3000 * i;
+      try { wait = Math.max(wait, (JSON.parse(text).retry_after || 0) * 1000); } catch (e) {}
+      await sleep(wait);
+      continue;
+    }
+    const err = new Error(`Discordエラー ${res.status} ${text}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+}
+
+async function reply(messageId, text) {
+  try {
+    await discord(`/channels/${CHANNEL}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({
+        content: text.slice(0, 1900),
+        message_reference: { message_id: messageId },
+        allowed_mentions: { parse: [] }
+      })
+    });
+  } catch (e) {
+    console.error('  返信失敗: ' + e.message);
+    if (e.status === 403) console.warn('  → Bot に「メッセージを送信」の権限がない可能性があります(予定の保存自体は完了しています)');
+  }
+}
+
+
+// ---------------------------------------------------------------
+//  日付まわり(日本時間で計算)
+// ---------------------------------------------------------------
+
+function todayJST() {
+  const t = new Date(Date.now() + 9 * 3600 * 1000);
+  return Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate());
+}
+
+function inRange(y, m) {
+  const ym = y * 12 + m;
+  return ym >= START.y * 12 + START.m && ym <= END.y * 12 + END.m;
+}
+
+function isValidDate(y, m, d) {
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+// 年が省略されたとき、期間内で「今日以降でいちばん近い年」を選ぶ
+function pickYear(m, d) {
+  const today = todayJST();
+  const cands = [];
+  for (let y = START.y; y <= END.y; y++) {
+    if (inRange(y, m) && isValidDate(y, m, d)) cands.push(y);
+  }
+  if (!cands.length) return null;
+  return cands.find(y => Date.UTC(y, m - 1, d) >= today) || cands[cands.length - 1];
+}
+
+
+// ---------------------------------------------------------------
+//  投稿文の解析
+// ---------------------------------------------------------------
+
+function stripBullet(s) {
+  return String(s).replace(/^[\s\u3000・･•●○◦▪*＊\-－−‐]+/, '');
+}
+
+// 全角→半角(1文字→1文字の変換なので、文字位置がずれない)
+function normalize(s) {
+  return String(s)
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/／/g, '/')
+    .replace(/．/g, '.')
+    .replace(/[－−‐–—]/g, '-')
+    .replace(/\u3000/g, ' ');
+}
+
+// head=true は行頭用で「.」区切りも許可(文中の「3.5」などを日付と誤認しないため)
+function dateRegex(head) {
+  const ys = head ? '[\\/\\-.年]' : '[\\/\\-年]';
+  const ms = head ? '[\\/\\-.月]' : '[\\/\\-月]';
+  return new RegExp(
+    (head ? '^\\s*' : '(?<!\\d)') +
+    '(?:(\\d{4})\\s*' + ys + '\\s*)?(\\d{1,2})\\s*' + ms + '\\s*(\\d{1,2})\\s*日?' +
+    '(?:\\s*[（(][日月火水木金土祝][）)])?(?!\\d)'
+  );
+}
+
+function findDate(line) {
+  const n = normalize(line);
+  const mt = n.match(dateRegex(true)) || n.match(dateRegex(false));
+  if (!mt) return null;
+  return { index: mt.index, length: mt[0].length, y: mt[1], m: mt[2], d: mt[3], raw: mt[0].trim() };
+}
+
+function resolveDate(f) {
+  const m = Number(f.m), d = Number(f.d);
+  const y = f.y ? Number(f.y) : pickYear(m, d);
+  if (!y || !isValidDate(y, m, d)) return { error: `${f.raw} は存在しない日付か、期間内に該当しません` };
+  if (!inRange(y, m)) {
+    return { error: `${f.raw}(${y}年${m}月)はカレンダーの期間外です(${START.y}年${START.m}月〜${END.y}年${END.m}月)` };
+  }
+  return { y, m, d };
+}
+
+function cleanText(s) {
+  return stripBullet(s)
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s:：、,，]+|[\s:：、,，]+$/g, '')
+    .trim();
+}
+
+const BULLET_RE = /^[\s\u3000]*[・･•●○◦▪*＊\-－−‐]/;
+
+// 投稿文 → { items: [{y,m,d,text}], errors: [文字列] }
+//  ・日付の行(11/2 など)があれば、そのあとの行はその日の予定
+//  ・日付と予定が同じ行でもOK(11/15 歯医者 / 会議 2027/1/20)
+//  ・1つの投稿に複数の日付を書いてもOK
+function parseMessage(content) {
+  const items = [], errors = [];
+  let cur = null;
+
+  String(content).split('\n').forEach(rawLine => {
+    const line = rawLine.replace(/\r/g, '');
+    if (!line.trim()) return;
+
+    let text;
+    if (BULLET_RE.test(line) && cur) {
+      text = cleanText(line);
+    } else {
+      const f = findDate(line);
+      if (f) {
+        const res = resolveDate(f);
+        if (res.error) { errors.push(res.error); cur = { bad: true }; return; }
+        cur = res;
+        text = cleanText(line.slice(0, f.index) + ' ' + line.slice(f.index + f.length));
+      } else if (cur) {
+        text = cleanText(line);   // 「・」なしの行も、直前の日付の予定にする
+      } else {
+        errors.push('日付が読み取れません:' + line.trim());
+        return;
+      }
+    }
+    if (text && cur && !cur.bad) items.push({ y: cur.y, m: cur.m, d: cur.d, text });
+  });
+
+  return { items, errors };
+}
+
+function buildReply(added, dups, errors) {
+  const fmt = ev => `・${ev.m}/${ev.d} ${ev.text}`;
+  const parts = [];
+  if (added.length) parts.push(`✅ ${added.length}件 受け付けました(スプレッドシートへの反映は数分後です)\n` + added.map(fmt).join('\n'));
+  if (dups.length)  parts.push(`⚠️ すでに登録済みのためスキップ\n` + dups.map(fmt).join('\n'));
+  if (errors.length) parts.push(`❌ 読み取れませんでした\n` + errors.map(e => '・' + e).join('\n'));
+  if (!parts.length) parts.push('❌ 予定の内容がありません。「11/2」の次の行に「・授業日」のように書いてください');
+  return parts.join('\n\n');
+}
+
+
+// ---------------------------------------------------------------
+//  メイン
+// ---------------------------------------------------------------
+
+async function main() {
+  const data = loadData();
+  console.log('処理済みの位置: ' + (data.lastMessageId || '(なし)'));
+
+  try {
+    // 初回は「いまの最新の投稿」を基準にして、それ以降だけを処理する
+    if (!data.lastMessageId && !READ_EXISTING_ON_FIRST_RUN) {
+      const latest = await discord(`/channels/${CHANNEL}/messages?limit=1`);
+      if (latest.length) {
+        data.lastMessageId = latest[0].id;
+        console.log('【初回】基準を記録しました。予定は、この後に新しく書き込んでください');
+      } else {
+        console.log('【初回】チャンネルに投稿がありません');
+      }
+      return;
+    }
+
+    const list = await discord(
+      `/channels/${CHANNEL}/messages?limit=100` + (data.lastMessageId ? `&after=${data.lastMessageId}` : ''));
+
+    // 古い順に並べ替え(IDは巨大な数なので文字列で比較)
+    const messages = list.sort((a, b) =>
+      a.id.length - b.id.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    console.log(`新しい投稿: ${messages.length}件`);
+
+    for (const msg of messages) {
+      const isBot = !!(msg.author && msg.author.bot);
+      const text = msg.content || '';
+      console.log(`投稿 ${msg.id} / bot=${isBot} / 本文の長さ=${text.length}`);
+
+      if (!isBot && text) {
+        const parsed = parseMessage(text);
+        const added = [], dups = [];
+        for (const ev of parsed.items) {
+          const exists = data.events.some(e => e.y === ev.y && e.m === ev.m && e.d === ev.d && e.text === ev.text);
+          if (exists) { dups.push(ev); continue; }
+          data.events.push({ seq: data.nextSeq++, ...ev });
+          added.push(ev);
+        }
+        console.log(`  受付${added.length}件 / 重複${dups.length}件 / エラー${parsed.errors.length}件`);
+        await reply(msg.id, buildReply(added, dups, parsed.errors));
+      } else if (!isBot) {
+        const hasOther = (msg.attachments && msg.attachments.length) || (msg.embeds && msg.embeds.length);
+        if (!hasOther) {
+          console.warn('  本文が空です。Developer Portal の Message Content Intent がOFFの可能性があります');
+          await reply(msg.id, '⚠️ 投稿の本文を読み取れませんでした。Bot の Message Content Intent がOFFの可能性があります');
+        }
+      }
+      data.lastMessageId = msg.id;
+    }
+  } finally {
+    saveData(data);   // 途中で失敗しても、ここまでの進捗は保存する
+  }
+}
+
+main().catch(e => {
+  console.error('失敗: ' + e.message);
+  if (e.status === 401) console.warn('→ DISCORD_BOT_TOKEN が間違っています');
+  if (e.status === 403 && /40333|1015/.test(e.body || '')) console.warn('→ 通信制限です。時間を置いて再実行してください');
+  else if (e.status === 403) console.warn('→ Bot が #カレンダー追加 を見る権限を持っていません');
+  if (e.status === 404) console.warn('→ DISCORD_CHANNEL_ID が間違っているか、Bot がサーバーに参加していません');
+  process.exit(1);
+});
