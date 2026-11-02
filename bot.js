@@ -1,4 +1,6 @@
 // Discord(#カレンダー追加)を確認して、予定を data/events.json に保存する
+//  ・通常の投稿 → 予定の追加
+//  ・1行目が del の投稿 → 予定の削除(2行目以降は追加と同じ書き方)
 // 受け付けた投稿には、返信ではなくリアクションを付ける
 // スプレッドシートへの反映は、Apps Script の syncEvents が GitHub から読み取って行う
 const fs = require('fs');
@@ -10,9 +12,10 @@ const END   = { y: 2028, m: 4 };
 const READ_EXISTING_ON_FIRST_RUN = false;  // true: 初回にチャンネルの直近100件も処理する
 
 // リアクションの絵文字
-const REACT_OK  = '☑️';   // 予定を受け付けた
-const REACT_DUP = '⚠️';   // すでに登録済み
-const REACT_ERR = '❌';   // 読み取れなかった
+const REACT_OK       = '☑️';   // 予定を受け付けた(追加・削除)
+const REACT_DUP      = '⚠️';   // すでに登録済み(追加をスキップ)
+const REACT_NOTFOUND = '❓';   // 削除の対象が記録になかった(シートからは削除を試みる)
+const REACT_ERR      = '❌';   // 読み取れなかった
 // ===================================================================
 
 const DATA_FILE = path.join(__dirname, 'data', 'events.json');
@@ -29,7 +32,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 
 // ---------------------------------------------------------------
-//  保存データ { lastMessageId, nextSeq, events: [{seq,y,m,d,text}] }
+//  保存データ { lastMessageId, nextSeq, events: [{seq,y,m,d,text,op?}] }
+//   op が無い、または 'add' → 追加の記録 / op が 'del' → 削除の記録
 // ---------------------------------------------------------------
 
 function loadData() {
@@ -45,6 +49,8 @@ function saveData(data) {
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 1) + '\n');
 }
+
+const sameEvent = (a, b) => a.y === b.y && a.m === b.m && a.d === b.d && a.text === b.text;
 
 
 // ---------------------------------------------------------------
@@ -136,7 +142,7 @@ function stripBullet(s) {
 // 全角→半角(1文字→1文字の変換なので、文字位置がずれない)
 function normalize(s) {
   return String(s)
-    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
     .replace(/／/g, '/')
     .replace(/．/g, '.')
     .replace(/[－−‐–—]/g, '-')
@@ -215,6 +221,60 @@ function parseMessage(content) {
   return { items, errors };
 }
 
+// 1行目が del / delete / 削除 なら削除コマンド。残りの行が「消したい予定」
+const DEL_RE = /^\s*(?:del|delete|削除)\s*$/i;
+
+function splitCommand(content) {
+  const lines = String(content).split('\n');
+  const idx = lines.findIndex(l => l.trim());
+  if (idx >= 0 && DEL_RE.test(normalize(lines[idx]))) {
+    return { isDelete: true, body: lines.slice(idx + 1).join('\n') };
+  }
+  return { isDelete: false, body: String(content) };
+}
+
+
+// ---------------------------------------------------------------
+//  追加・削除の処理
+// ---------------------------------------------------------------
+
+function handleAdd(data, parsed) {
+  const added = [], dups = [];
+  for (const ev of parsed.items) {
+    const exists = data.events.some(e => e.op !== 'del' && sameEvent(e, ev));
+    if (exists) { dups.push(ev); continue; }
+    data.events.push({ seq: data.nextSeq++, ...ev });
+    added.push(ev);
+  }
+  console.log(`  追加: 受付${added.length}件 / 重複${dups.length}件 / エラー${parsed.errors.length}件`);
+
+  const emojis = [];
+  if (added.length) emojis.push(REACT_OK);
+  if (dups.length) emojis.push(REACT_DUP);
+  if (parsed.errors.length || (!added.length && !dups.length)) emojis.push(REACT_ERR);
+  return emojis;
+}
+
+function handleDelete(data, parsed) {
+  const removed = [], notFound = [];
+  for (const ev of parsed.items) {
+    // GitHub上の記録から取り除く(まだシートに反映されていない予定なら、これで追加自体が無かったことになる)
+    const before = data.events.length;
+    data.events = data.events.filter(e => !(e.op !== 'del' && sameEvent(e, ev)));
+    if (data.events.length < before) removed.push(ev); else notFound.push(ev);
+
+    // シートからも消すため、削除の記録を残す(シートに手書きした予定も消せる)
+    data.events.push({ seq: data.nextSeq++, op: 'del', ...ev });
+  }
+  console.log(`  削除: 記録あり${removed.length}件 / 記録なし${notFound.length}件 / エラー${parsed.errors.length}件`);
+
+  const emojis = [];
+  if (removed.length) emojis.push(REACT_OK);
+  if (notFound.length) emojis.push(REACT_NOTFOUND);
+  if (parsed.errors.length || (!removed.length && !notFound.length)) emojis.push(REACT_ERR);
+  return emojis;
+}
+
 
 // ---------------------------------------------------------------
 //  メイン
@@ -251,21 +311,11 @@ async function main() {
       console.log(`投稿 ${msg.id} / bot=${isBot} / 本文の長さ=${text.length}`);
 
       if (!isBot && text) {
-        const parsed = parseMessage(text);
-        const added = [], dups = [];
-        for (const ev of parsed.items) {
-          const exists = data.events.some(e => e.y === ev.y && e.m === ev.m && e.d === ev.d && e.text === ev.text);
-          if (exists) { dups.push(ev); continue; }
-          data.events.push({ seq: data.nextSeq++, ...ev });
-          added.push(ev);
-        }
-        console.log(`  受付${added.length}件 / 重複${dups.length}件 / エラー${parsed.errors.length}件`);
+        const cmd = splitCommand(text);
+        const parsed = parseMessage(cmd.body);
         parsed.errors.forEach(e => console.log('  エラー内容: ' + e));
 
-        const emojis = [];
-        if (added.length) emojis.push(REACT_OK);
-        if (dups.length) emojis.push(REACT_DUP);
-        if (parsed.errors.length || (!added.length && !dups.length)) emojis.push(REACT_ERR);
+        const emojis = cmd.isDelete ? handleDelete(data, parsed) : handleAdd(data, parsed);
         await react(msg.id, emojis);
       } else if (!isBot) {
         const hasOther = (msg.attachments && msg.attachments.length) || (msg.embeds && msg.embeds.length);
