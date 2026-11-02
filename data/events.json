@@ -1,5 +1,13 @@
 {
- "lastMessageId": "1566598628473311363",
- "nextSeq": 1,
- "events": []
+ "lastMessageId": "1566605744906833993",
+ "nextSeq": 2,
+ "events": [
+  {
+   "seq": 1,
+   "y": 2026,
+   "m": 11,
+   "d": 24,
+   "text": "企画"
+  }
+ ]
 }
