@@ -2,7 +2,7 @@ name: Discord to Calendar
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'   # 15分ごと、混みにくい時刻
+    - cron: '*/5 * * * *'
   workflow_dispatch:         # 手動実行用
 
 permissions:
