@@ -1,4 +1,5 @@
 // Discord(#カレンダー追加)を確認して、予定を data/events.json に保存する
+// 受け付けた投稿には、返信ではなくリアクションを付ける
 // スプレッドシートへの反映は、Apps Script の syncEvents が GitHub から読み取って行う
 const fs = require('fs');
 const path = require('path');
@@ -7,6 +8,11 @@ const path = require('path');
 const START = { y: 2026, m: 10 };
 const END   = { y: 2028, m: 4 };
 const READ_EXISTING_ON_FIRST_RUN = false;  // true: 初回にチャンネルの直近100件も処理する
+
+// リアクションの絵文字
+const REACT_OK  = '☑️';   // 予定を受け付けた
+const REACT_DUP = '⚠️';   // すでに登録済み
+const REACT_ERR = '❌';   // 読み取れなかった
 // ===================================================================
 
 const DATA_FILE = path.join(__dirname, 'data', 'events.json');
@@ -72,19 +78,18 @@ async function discord(apiPath, options = {}) {
   }
 }
 
-async function reply(messageId, text) {
-  try {
-    await discord(`/channels/${CHANNEL}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({
-        content: text.slice(0, 1900),
-        message_reference: { message_id: messageId },
-        allowed_mentions: { parse: [] }
-      })
-    });
-  } catch (e) {
-    console.error('  返信失敗: ' + e.message);
-    if (e.status === 403) console.warn('  → Bot に「メッセージを送信」の権限がない可能性があります(予定の保存自体は完了しています)');
+// 投稿にリアクションを付ける(失敗しても処理は続ける)
+async function react(messageId, emojis) {
+  for (const emoji of emojis) {
+    try {
+      await discord(
+        `/channels/${CHANNEL}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+        { method: 'PUT' });
+    } catch (e) {
+      console.error(`  リアクション失敗(${emoji}): ${e.message}`);
+      if (e.status === 403) console.warn('  → Bot に「リアクションの追加」の権限がない可能性があります(予定の保存自体は完了しています)');
+    }
+    await sleep(400);   // リアクションは連続で付けると制限されやすい
   }
 }
 
@@ -210,16 +215,6 @@ function parseMessage(content) {
   return { items, errors };
 }
 
-function buildReply(added, dups, errors) {
-  const fmt = ev => `・${ev.m}/${ev.d} ${ev.text}`;
-  const parts = [];
-  if (added.length) parts.push(`✅ ${added.length}件 受け付けました(スプレッドシートへの反映は数分後です)\n` + added.map(fmt).join('\n'));
-  if (dups.length)  parts.push(`⚠️ すでに登録済みのためスキップ\n` + dups.map(fmt).join('\n'));
-  if (errors.length) parts.push(`❌ 読み取れませんでした\n` + errors.map(e => '・' + e).join('\n'));
-  if (!parts.length) parts.push('❌ 予定の内容がありません。「11/2」の次の行に「・授業日」のように書いてください');
-  return parts.join('\n\n');
-}
-
 
 // ---------------------------------------------------------------
 //  メイン
@@ -265,12 +260,18 @@ async function main() {
           added.push(ev);
         }
         console.log(`  受付${added.length}件 / 重複${dups.length}件 / エラー${parsed.errors.length}件`);
-        await reply(msg.id, buildReply(added, dups, parsed.errors));
+        parsed.errors.forEach(e => console.log('  エラー内容: ' + e));
+
+        const emojis = [];
+        if (added.length) emojis.push(REACT_OK);
+        if (dups.length) emojis.push(REACT_DUP);
+        if (parsed.errors.length || (!added.length && !dups.length)) emojis.push(REACT_ERR);
+        await react(msg.id, emojis);
       } else if (!isBot) {
         const hasOther = (msg.attachments && msg.attachments.length) || (msg.embeds && msg.embeds.length);
         if (!hasOther) {
           console.warn('  本文が空です。Developer Portal の Message Content Intent がOFFの可能性があります');
-          await reply(msg.id, '⚠️ 投稿の本文を読み取れませんでした。Bot の Message Content Intent がOFFの可能性があります');
+          await react(msg.id, [REACT_ERR]);
         }
       }
       data.lastMessageId = msg.id;
